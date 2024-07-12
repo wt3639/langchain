@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -11,6 +12,8 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Protocol,
+    Tuple,
     Type,
     TypedDict,
     Union,
@@ -19,18 +22,33 @@ from typing import (
 from uuid import UUID, uuid4
 
 from langchain_core.pydantic_v1 import BaseModel
-from langchain_core.runnables.graph_ascii import draw_ascii
 
 if TYPE_CHECKING:
     from langchain_core.runnables.base import Runnable as RunnableType
 
 
+class Stringifiable(Protocol):
+    def __str__(self) -> str: ...
+
+
 class LabelsDict(TypedDict):
+    """Dictionary of labels for nodes and edges in a graph."""
+
     nodes: dict[str, str]
+    """Labels for nodes."""
     edges: dict[str, str]
+    """Labels for edges."""
 
 
 def is_uuid(value: str) -> bool:
+    """Check if a string is a valid UUID.
+
+    Args:
+        value: The string to check.
+
+    Returns:
+        True if the string is a valid UUID, False otherwise.
+    """
     try:
         UUID(value)
         return True
@@ -43,14 +61,35 @@ class Edge(NamedTuple):
 
     source: str
     target: str
-    data: Optional[str] = None
+    data: Optional[Stringifiable] = None
+    conditional: bool = False
+
+    def copy(
+        self, *, source: Optional[str] = None, target: Optional[str] = None
+    ) -> Edge:
+        return Edge(
+            source=source or self.source,
+            target=target or self.target,
+            data=self.data,
+            conditional=self.conditional,
+        )
 
 
 class Node(NamedTuple):
     """Node in a graph."""
 
     id: str
+    name: str
     data: Union[Type[BaseModel], RunnableType]
+    metadata: Optional[Dict[str, Any]]
+
+    def copy(self, *, id: Optional[str] = None, name: Optional[str] = None) -> Node:
+        return Node(
+            id=id or self.id,
+            name=name or self.name,
+            data=self.data,
+            metadata=self.metadata,
+        )
 
 
 class Branch(NamedTuple):
@@ -78,12 +117,12 @@ class CurveStyle(Enum):
 
 
 @dataclass
-class NodeColors:
+class NodeStyles:
     """Schema for Hexadecimal color codes for different node types"""
 
-    start: str = "#ffdfba"
-    end: str = "#baffc9"
-    other: str = "#fad7de"
+    default: str = "fill:#f2f0ff,line-height:1.2"
+    first: str = "fill-opacity:0"
+    last: str = "fill:#bfb6fc"
 
 
 class MermaidDrawMethod(Enum):
@@ -93,53 +132,61 @@ class MermaidDrawMethod(Enum):
     API = "api"  # Uses Mermaid.INK API to render the graph
 
 
-def node_data_str(node: Node) -> str:
+def node_data_str(id: str, data: Union[Type[BaseModel], RunnableType]) -> str:
+    """Convert the data of a node to a string.
+
+    Args:
+        id: The node id.
+        data: The node data.
+
+    Returns:
+        A string representation of the data.
+    """
     from langchain_core.runnables.base import Runnable
 
-    if not is_uuid(node.id):
-        return node.id
-    elif isinstance(node.data, Runnable):
-        try:
-            data = str(node.data)
-            if (
-                data.startswith("<")
-                or data[0] != data[0].upper()
-                or len(data.splitlines()) > 1
-            ):
-                data = node.data.__class__.__name__
-            elif len(data) > 42:
-                data = data[:42] + "..."
-        except Exception:
-            data = node.data.__class__.__name__
+    if not is_uuid(id):
+        return id
+    elif isinstance(data, Runnable):
+        data_str = data.get_name()
     else:
-        data = node.data.__name__
-    return data if not data.startswith("Runnable") else data[8:]
+        data_str = data.__name__
+    return data_str if not data_str.startswith("Runnable") else data_str[8:]
 
 
 def node_data_json(
     node: Node, *, with_schemas: bool = False
 ) -> Dict[str, Union[str, Dict[str, Any]]]:
+    """Convert the data of a node to a JSON-serializable format.
+
+    Args:
+        node: The node to convert.
+        with_schemas: Whether to include the schema of the data if
+            it is a Pydantic model.
+
+    Returns:
+        A dictionary with the type of the data and the data itself.
+    """
     from langchain_core.load.serializable import to_json_not_implemented
     from langchain_core.runnables.base import Runnable, RunnableSerializable
 
     if isinstance(node.data, RunnableSerializable):
-        return {
+        json: Dict[str, Any] = {
             "type": "runnable",
             "data": {
                 "id": node.data.lc_id(),
-                "name": node.data.get_name(),
+                "name": node_data_str(node.id, node.data),
             },
         }
     elif isinstance(node.data, Runnable):
-        return {
+        json = {
             "type": "runnable",
             "data": {
                 "id": to_json_not_implemented(node.data)["id"],
-                "name": node.data.get_name(),
+                "name": node_data_str(node.id, node.data),
             },
         }
     elif inspect.isclass(node.data) and issubclass(node.data, BaseModel):
-        return (
+        json = (
             {
                 "type": "schema",
                 "data": node.data.schema(),
@@ -147,14 +194,17 @@ def node_data_json(
             if with_schemas
             else {
                 "type": "schema",
-                "data": node_data_str(node),
+                "data": node_data_str(node.id, node.data),
             }
         )
     else:
-        return {
+        json = {
             "type": "unknown",
-            "data": node_data_str(node),
+            "data": node_data_str(node.id, node.data),
         }
+    if node.metadata is not None:
+        json["metadata"] = node.metadata
+    return json
 
 
 @dataclass
@@ -163,7 +213,6 @@ class Graph:
 
     nodes: Dict[str, Node] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
-    branches: Optional[Dict[str, List[Branch]]] = field(default_factory=dict)
 
     def to_json(self, *, with_schemas: bool = False) -> Dict[str, List[Dict[str, Any]]]:
         """Convert the graph to a JSON-serializable format."""
@@ -171,6 +220,17 @@ class Graph:
             node.id: i if is_uuid(node.id) else node.id
             for i, node in enumerate(self.nodes.values())
         }
+        edges: List[Dict[str, Any]] = []
+        for edge in self.edges:
+            edge_dict = {
+                "source": stable_node_ids[edge.source],
+                "target": stable_node_ids[edge.target],
+            }
+            if edge.data is not None:
+                edge_dict["data"] = edge.data
+            if edge.conditional:
+                edge_dict["conditional"] = True
+            edges.append(edge_dict)
 
         return {
             "nodes": [
@@ -180,19 +240,7 @@ class Graph:
                 }
                 for node in self.nodes.values()
             ],
-            "edges": [
-                {
-                    "source": stable_node_ids[edge.source],
-                    "target": stable_node_ids[edge.target],
-                    "data": edge.data,
-                }
-                if edge.data is not None
-                else {
-                    "source": stable_node_ids[edge.source],
-                    "target": stable_node_ids[edge.target],
-                }
-                for edge in self.edges
-            ],
+            "edges": edges,
         }
 
     def __bool__(self) -> bool:
@@ -202,17 +250,22 @@ class Graph:
         return uuid4().hex
 
     def add_node(
-        self, data: Union[Type[BaseModel], RunnableType], id: Optional[str] = None
+        self,
+        data: Union[Type[BaseModel], RunnableType],
+        id: Optional[str] = None,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Node:
         """Add a node to the graph and return it."""
         if id is not None and id in self.nodes:
             raise ValueError(f"Node with id {id} already exists")
-        node = Node(id=id or self.next_id(), data=data)
+        id = id or self.next_id()
+        node = Node(id=id, data=data, metadata=metadata, name=node_data_str(id, data))
         self.nodes[node.id] = node
         return node
 
     def remove_node(self, node: Node) -> None:
-        """Remove a node from the graphm and all edges connected to it."""
+        """Remove a node from the graph and all edges connected to it."""
         self.nodes.pop(node.id)
         self.edges = [
             edge
@@ -220,21 +273,79 @@ class Graph:
             if edge.source != node.id and edge.target != node.id
         ]
 
-    def add_edge(self, source: Node, target: Node, data: Optional[str] = None) -> Edge:
+    def add_edge(
+        self,
+        source: Node,
+        target: Node,
+        data: Optional[Stringifiable] = None,
+        conditional: bool = False,
+    ) -> Edge:
         """Add an edge to the graph and return it."""
         if source.id not in self.nodes:
             raise ValueError(f"Source node {source.id} not in graph")
         if target.id not in self.nodes:
             raise ValueError(f"Target node {target.id} not in graph")
-        edge = Edge(source=source.id, target=target.id, data=data)
+        edge = Edge(
+            source=source.id, target=target.id, data=data, conditional=conditional
+        )
         self.edges.append(edge)
         return edge
 
-    def extend(self, graph: Graph) -> None:
+    def extend(
+        self, graph: Graph, *, prefix: str = ""
+    ) -> Tuple[Optional[Node], Optional[Node]]:
         """Add all nodes and edges from another graph.
         Note this doesn't check for duplicates, nor does it connect the graphs."""
-        self.nodes.update(graph.nodes)
-        self.edges.extend(graph.edges)
+        if all(is_uuid(node.id) for node in graph.nodes.values()):
+            prefix = ""
+
+        def prefixed(id: str) -> str:
+            return f"{prefix}:{id}" if prefix else id
+
+        # prefix each node
+        self.nodes.update(
+            {prefixed(k): v.copy(id=prefixed(k)) for k, v in graph.nodes.items()}
+        )
+        # prefix each edge's source and target
+        self.edges.extend(
+            [
+                edge.copy(source=prefixed(edge.source), target=prefixed(edge.target))
+                for edge in graph.edges
+            ]
+        )
+        # return (prefixed) first and last nodes of the subgraph
+        first, last = graph.first_node(), graph.last_node()
+        return (
+            first.copy(id=prefixed(first.id)) if first else None,
+            last.copy(id=prefixed(last.id)) if last else None,
+        )
+
+    def reid(self) -> Graph:
+        """Return a new graph with all nodes re-identified,
+        using their unique, readable names where possible."""
+        node_labels = {node.id: node.name for node in self.nodes.values()}
+        node_label_counts = Counter(node_labels.values())
+
+        def _get_node_id(node_id: str) -> str:
+            label = node_labels[node_id]
+            if is_uuid(node_id) and node_label_counts[label] == 1:
+                return label
+            else:
+                return node_id
+
+        return Graph(
+            nodes={
+                _get_node_id(id): node.copy(id=_get_node_id(id))
+                for id, node in self.nodes.items()
+            },
+            edges=[
+                edge.copy(
+                    source=_get_node_id(edge.source),
+                    target=_get_node_id(edge.target),
+                )
+                for edge in self.edges
+            ],
+        )
 
     def first_node(self) -> Optional[Node]:
         """Find the single node that is not a target of any edge.
@@ -284,9 +395,11 @@ class Graph:
                 self.remove_node(last_node)
 
     def draw_ascii(self) -> str:
+        from langchain_core.runnables.graph_ascii import draw_ascii
+
         return draw_ascii(
-            {node.id: node_data_str(node) for node in self.nodes.values()},
-            [(edge.source, edge.target) for edge in self.edges],
+            {node.id: node.name for node in self.nodes.values()},
+            self.edges,
         )
 
     def print_ascii(self) -> None:
@@ -298,8 +411,7 @@ class Graph:
         output_file_path: str,
         fontname: Optional[str] = None,
         labels: Optional[LabelsDict] = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     def draw_png(
@@ -307,8 +419,7 @@ class Graph:
         output_file_path: None,
         fontname: Optional[str] = None,
         labels: Optional[LabelsDict] = None,
-    ) -> bytes:
-        ...
+    ) -> bytes: ...
 
     def draw_png(
         self,
@@ -318,9 +429,7 @@ class Graph:
     ) -> Union[bytes, None]:
         from langchain_core.runnables.graph_png import PngDrawer
 
-        default_node_labels = {
-            node.id: node_data_str(node) for node in self.nodes.values()
-        }
+        default_node_labels = {node.id: node.name for node in self.nodes.values()}
 
         return PngDrawer(
             fontname,
@@ -335,39 +444,34 @@ class Graph:
 
     def draw_mermaid(
         self,
+        *,
+        with_styles: bool = True,
         curve_style: CurveStyle = CurveStyle.LINEAR,
-        node_colors: NodeColors = NodeColors(
-            start="#ffdfba", end="#baffc9", other="#fad7de"
-        ),
+        node_colors: NodeStyles = NodeStyles(),
         wrap_label_n_words: int = 9,
     ) -> str:
         from langchain_core.runnables.graph_mermaid import draw_mermaid
 
-        nodes = {node.id: node_data_str(node) for node in self.nodes.values()}
-
-        first_node = self.first_node()
-        first_label = node_data_str(first_node) if first_node is not None else None
-
-        last_node = self.last_node()
-        last_label = node_data_str(last_node) if last_node is not None else None
+        graph = self.reid()
+        first_node = graph.first_node()
+        last_node = graph.last_node()
 
         return draw_mermaid(
-            nodes=nodes,
-            edges=self.edges,
-            branches=self.branches,
-            first_node_label=first_label,
-            last_node_label=last_label,
+            nodes=graph.nodes,
+            edges=graph.edges,
+            first_node=first_node.id if first_node else None,
+            last_node=last_node.id if last_node else None,
+            with_styles=with_styles,
             curve_style=curve_style,
-            node_colors=node_colors,
+            node_styles=node_colors,
             wrap_label_n_words=wrap_label_n_words,
         )
 
     def draw_mermaid_png(
         self,
+        *,
         curve_style: CurveStyle = CurveStyle.LINEAR,
-        node_colors: NodeColors = NodeColors(
-            start="#ffdfba", end="#baffc9", other="#fad7de"
-        ),
+        node_colors: NodeStyles = NodeStyles(),
         wrap_label_n_words: int = 9,
         output_file_path: Optional[str] = None,
         draw_method: MermaidDrawMethod = MermaidDrawMethod.API,
